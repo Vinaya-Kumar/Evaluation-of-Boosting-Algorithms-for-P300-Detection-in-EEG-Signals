@@ -63,4 +63,131 @@ def ensure_nct(X: np.ndarray) -> np.ndarray:
         raise ValueError(f"Expected 3D array, got shape {X.shape}")
     n, a, b = X.shape
     # If a <= b, treat 'a' as channels; else swap
-    return X if a <= b else n
+    return X if a <= b else np.swapaxes(X, 1, 2)
+
+
+def flatten_trials(X: np.ndarray) -> np.ndarray:
+    n, c, t = X.shape
+    return X.reshape(n, c * t)
+
+
+def reshape_back(flat: np.ndarray, c: int, t: int) -> np.ndarray:
+    return flat.reshape(flat.shape[0], c, t)
+
+
+def oversample_flat(arr: np.ndarray, y: np.ndarray, sampling_strategy: float):
+    ros = RandomOverSampler(sampling_strategy=sampling_strategy)
+    X_over, y_over = ros.fit_resample(arr, y)
+    return X_over, y_over
+
+
+def extract_feature_blocks(X_nct: np.ndarray, sfreq: float,
+                           fit_riemann: bool, y=None, xc=None, ts=None):
+    """
+    Returns:
+        X_full: concatenated features (n, 296)
+        X_riem: XDawn+TangentSpace only (n, 136)
+        (xc, ts): fitted transformers
+    """
+    params1 = ['mean', 'variance', 'std']          # 3C
+    params2 = ['higuchi_fd', 'hurst_exp']          # 2C
+    params3 = ['spect_entropy', 'ptp_amp']         # 2C
+    params4 = ['wavelet_coef_energy']              # 3C
+
+    # mne-features expects (n_epochs, n_channels, n_times)
+    X_nct = np.asarray(X_nct, dtype=float)
+
+    new_X1 = extract_features(X_nct, sfreq, params1)
+    new_X2 = extract_features(X_nct, sfreq, params2)
+    new_X3 = extract_features(X_nct, sfreq, params3)
+    new_X4 = extract_features(X_nct, sfreq, params4)
+
+    if fit_riemann:
+        if y is None:
+            raise ValueError("Labels y are required to fit XdawnCovariances.")
+        xc = XdawnCovariances(nfilter=4, estimator="oas", xdawn_estimator="oas")
+        ts = TangentSpace(metric="riemann")
+        Xr = ts.fit_transform(xc.fit_transform(X_nct, y))
+    else:
+        if xc is None or ts is None:
+            raise ValueError("Provide fitted xc and ts when fit_riemann=False.")
+        Xr = ts.transform(xc.transform(X_nct))
+
+    # Order mirrors the notebook concatenations
+    X_full = np.concatenate([new_X1, new_X2, new_X3, new_X4, Xr], axis=1)
+    return X_full, Xr, (xc, ts)
+
+
+def save_npys(out_dir: str, name_to_array: dict):
+    os.makedirs(out_dir, exist_ok=True)
+    for name, arr in name_to_array.items():
+        np.save(os.path.join(out_dir, f"{name}.npy"), arr)
+
+
+# ------------------------- main -------------------------
+
+def main():
+    ap = argparse.ArgumentParser(description="ERP-BCI Feature Extraction (.npy to feature matrices)")
+    ap.add_argument("--data-dir", type=str, default=".", help="Folder with X_train.npy, X_test.npy, Y_train.npy, Y_test.npy")
+    ap.add_argument("--out-linear", type=str, default="Linear and Non Linear Features", help="Output folder for full feature matrices (296 dims)")
+    ap.add_argument("--out-xdawn",  type=str, default="XDawn", help="Output folder for XDawn/TangentSpace-only features (136 dims)")
+    ap.add_argument("--sfreq",      type=float, default=128.0, help="Sampling frequency for mne-features")
+    ap.add_argument("--oversample", type=float, default=0.5, help="RandomOverSampler sampling_strategy (minority:majority)")
+    args = ap.parse_args()
+
+    # Load
+    X_train_raw, X_test_raw, Y_train, Y_test = load_arrays(args.data_dir)
+    print(f"Loaded:")
+    print(f"  X_train: {X_train_raw.shape}  X_test: {X_test_raw.shape}")
+    print(f"  Y_train: {Y_train.shape}      Y_test: {Y_test.shape}")
+
+    # Ensure (n, C, T)
+    Xtr = ensure_nct(X_train_raw)
+    Xte = ensure_nct(X_test_raw)
+    ntr, C, T = Xtr.shape
+    print(f"Using (n, channels, times) = ({ntr}, {C}, {T})")
+
+    # Oversample (train & test, matching notebook behavior)
+    Xtr_flat = flatten_trials(Xtr)
+    Xte_flat = flatten_trials(Xte)
+
+    Xtr_over_flat, ytr_over = oversample_flat(Xtr_flat, Y_train, args.oversample)
+    Xte_over_flat, yte_over = oversample_flat(Xte_flat, Y_test,  args.oversample)
+
+    Xtr_over = reshape_back(Xtr_over_flat, C, T)
+    Xte_over = reshape_back(Xte_over_flat, C, T)
+
+    print(f"Oversampled:")
+    print(f"  Train -> {Xtr_over.shape}, labels: {ytr_over.shape}")
+    print(f"  Test  -> {Xte_over.shape}, labels: {yte_over.shape}")
+
+    # Feature extraction
+    Xtr_full, Xtr_riem, (xc, ts) = extract_feature_blocks(Xtr_over, args.sfreq, fit_riemann=True, y=ytr_over)
+    Xte_full, Xte_riem, _        = extract_feature_blocks(Xte_over, args.sfreq, fit_riemann=False, xc=xc, ts=ts)
+
+    print(f"Feature shapes:")
+    print(f"  Train full: {Xtr_full.shape}   Train XDawn: {Xtr_riem.shape}")
+    print(f"  Test  full: {Xte_full.shape}   Test  XDawn: {Xte_riem.shape}")
+    # Expect full = (., 296) and XDawn = (., 136)
+
+    # Save outputs (both full and XDawn-only sets), along with (oversampled) y
+    save_npys(args.out_linear, {
+        "X_train": Xtr_full,
+        "X_test":  Xte_full,
+        "y_train": ytr_over,
+        "y_test":  yte_over,
+    })
+    save_npys(args.out_xdawn, {
+        "X_train": Xtr_riem,
+        "X_test":  Xte_riem,
+        "y_train": ytr_over,
+        "y_test":  yte_over,
+    })
+
+    print(f"\nSaved:")
+    print(f"  Full features -> {os.path.abspath(args.out_linear)} (X_train.npy, X_test.npy, y_train.npy, y_test.npy)")
+    print(f"  XDawn only    -> {os.path.abspath(args.out_xdawn)} (X_train.npy, X_test.npy, y_train.npy, y_test.npy)")
+
+
+if __name__ == "__main__":
+    main()
