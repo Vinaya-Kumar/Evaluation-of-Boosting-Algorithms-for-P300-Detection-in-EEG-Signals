@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""
+BCI-NER feature pipeline + CatBoost classifier (Notebook -> .py)
+
+Usage (XDAWN features already computed, like in your notebook’s final cells):
+  python bci_ner_pipeline.py \
+    --x-train XDAWN/X_train.npy \
+    --x-test  XDAWN/X_test.npy \
+    --y-train Y_train.npy \
+    --y-test-csv true_labels.csv
+
+Optional: hyperparameter search with Optuna:
+  python bci_ner_pipeline.py ... --do-optuna --optuna-timeout 600
+
+Optional: raw EEG -> mne-features (if you have 3D arrays of shape (n, 56, 140))
+  python bci_ner_pipeline.py \
+    --x-train train_data.npy \
+    --x-test  test_data.npy \
+    --y-train Y_train.npy \
+    --y-test-csv true_labels.csv \
+    --sfreq 128 --do-extract
+
+Notes:
+- If --do-extract is set and inputs are 3D arrays, we compute features using mne-features:
+  ['mean','variance','std','higuchi_fd','hurst_exp','spect_entropy','ptp_amp'] and concatenate.
+- Defaults mirror the best trial you found: depth=6, iterations=76, learning_rate≈0.83935
+"""
+
+import argparse
+import sys
+import numpy as np
+import pandas as pd
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
+
+# Optional imports guarded where needed
+try:
+    from catboost import CatBoostClassifier
+except Exception as e:
+    print("CatBoost is required. Try: pip install catboost", file=sys.stderr)
+    raise
+
+def maybe_extract_features(X: np.ndarray, sfreq: int) -> np.ndarray:
+    """
+    If X is 3D (n_trials, n_channels, n_samples), compute mne-features and return 2D features.
+    Otherwise just return X (assumed precomputed features).
+    """
+    if X.ndim != 3:
+        # Already flat features
+        return X
+
+    try:
+        from mne_features.feature_extraction import extract_features
+    except Exception:
+        print(
+            "mne-features is required for raw feature extraction. "
+            "Install with: pip install mne-features",
+            file=sys.stderr,
+        )
+        raise
+
+    # Match the notebook’s choices
+    params1 = ['mean', 'variance', 'std']
+    params2 = ['higuchi_fd', 'hurst_exp']
+    params3 = ['spect_entropy', 'ptp_amp']
+
+    f1 = extract_features(X, sfreq, params1)  # shape (n, ?)
+    f2 = extract_features(X, sfreq, params2)
+    f3 = extract_features(X, sfreq, params3)
+    feats = np.concatenate([f1, f2, f3], axis=1)
+    return feats
+
+
+def load_y(y_npy: str = None, y_csv: str = None) -> np.ndarray:
+    if (y_npy is None) == (y_csv is None):
+        raise ValueError("Provide exactly one of --y-train/--y-test (NPY) or --y-train-csv/--y-test-csv (CSV).")
+    if y_npy:
+        y = np.load(y_npy)
+    else:
+        y = pd.read_csv(y_csv, header=None).values.ravel()
+    return y
+
+
+def optuna_search(X_train, y_train, X_valid, y_valid, timeout_sec: int):
+    try:
+        import optuna
+    except Exception:
+        print("Optuna is not installed. Try: pip install optuna", file=sys.stderr)
+        raise
+
+    def objective(trial: "optuna.trial.Trial") -> float:
+        params = {
+            "iterations": trial.suggest_int("iterations", 10, 100),
+            "depth": trial.suggest_int("depth", 4, 10),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 1.0),
+            "loss_function": "Logloss",
+            "verbose": 0,
+        }
+        model = CatBoostClassifier(**params)
+        model.fit(X_train, y_train, eval_set=(X_valid, y_valid), verbose=False, use_best_model=False)
+        preds = model.predict(X_valid)
+        return accuracy_score(y_valid, preds)
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, timeout=timeout_sec)
+    best = study.best_params
+    print("\n[Optuna] Best params:", best)
+    print("[Optuna] Best accuracy:", study.best_value)
+    return best
+
+
+def main():
+    ap = argparse.ArgumentParser(description="BCI-NER CatBoost (Notebook → .py)")
+    # Inputs (features OR raw)
+    ap.add_argument("--x-train", required=True, help="Path to X_train .npy (either features or raw 3D)")
+    ap.add_argument("--x-test", required=True, help="Path to X_test .npy (either features or raw 3D)")
+    ap.add_argument("--y-train", help="Path to y_train .npy")
+    ap.add_argument("--y-test", help="Path to y_test .npy")
+    ap.add_argument("--y-train-csv", help="Path to y_train CSV (header=None)")
+    ap.add_argument("--y-test-csv", help="Path to y_test CSV (header=None)")
+
+    # Raw feature extraction options
+    ap.add_argument("--do-extract", action="store_true", help="If set and X are 3D, compute mne-features")
+    ap.add_argument("--sfreq", type=int, default=128, help="Sampling frequency for mne-features (default 128)")
+
+    # CatBoost params (defaults = your best trial)
+    ap.add_argument("--iterations", type=int, default=76)
+    ap.add_argument("--depth", type=int, default=6)
+    ap.add_argument("--learning-rate", type=float, default=0.8393549526486038)
+
+    # Optuna
+    ap.add_argument("--do-optuna", action="store_true", help="Run Optuna search on (train vs. test)")
+    ap.add_argument("--optuna-timeout", type=int, default=600)
+
+    # Misc
+    ap.add_argument("--save-model", default=None, help="Path to save CatBoost model (optional)")
+    ap.add_argument("--save-preds", default=None, help="CSV path to save test predictions (optional)")
+
+    args = ap.parse_args()
+
+    # Load data
+    X_train = np.load(args.x_train)
+    X_test = np.load(args.x_test)
+
+    # Labels (exactly one source per label set)
+    y_train = load_y(args.y_train, args.y_train_csv)
+    y_test = load_y(args.y_test, args.y_test_csv)
+
+    # Optional raw feature extraction
+    if args.do_extract:
+        X_train = maybe_extract_features(X_train, args.sfreq)
+        X_test = maybe_extract_features(X_test, args.sfreq)
+
+    print(f"X_train shape: {X_train.shape}")
+    print(f"X_test  shape: {X_test.shape}")
+    print(f"y_train shape: {y_train.shape}")
+    print(f"y_test  shape: {y_test.shape}")
+
+    # Params (Optuna overrides defaults if requested)
+    params = {
+        "iterations": args.iterations,
+        "depth": args.depth,
+        "learning_rate": args.learning_rate,
+        "loss_function": "Logloss",
+        "verbose": True,
+    }
+
+    if args.do_optuna:
+        best = optuna_search(X_train, y_train, X_test, y_test, timeout_sec=args.optuna_timeout)
+        params.update(best)
+        # Ensure required keys exist after update (learning_rate name consistency)
+        if "learning_float" in params and "learning_rate" not in params:
+            params["learning_rate"] = params.pop("learning_float")
+
+    # Train final model
+    print("\n[Fitting CatBoost] params:", params)
+    model = CatBoostClassifier(**params)
+    model.fit(X_train, y_train)
+
+    # Predict & report
+    y_pred = model.predict(X_test)
+    print("\nClassification report:\n")
+    print(classification_report(y_test, y_pred, digits=4))
+    acc = accuracy_score(y_test, y_pred)
+    print(f"Accuracy: {acc:.4f}")
+
+    cm = confusion_matrix(y_test, y_pred)
+    print("\nConfusion matrix:")
+    print(cm)
+
+    # Save artifacts
+    if args.save_model:
+        model.save_model(args.save_model)
+        print(f"\nModel saved to: {args.save_model}")
+    if args.save_preds:
+        pd.Series(y_pred.astype(int).ravel()).to_csv(args.save_preds, index=False, header=False)
+        print(f"Predictions saved to: {args.save_preds}")
+
+
+if __name__ == "__main__":
+    main()
